@@ -2,6 +2,10 @@ import discord
 from discord.ext import commands
 import os
 import json
+import time
+import hmac
+import base64
+import hashlib
 import requests
 import asyncio
 import threading
@@ -9,6 +13,7 @@ import traceback
 from flask import Flask, request, jsonify
 from flask_cors import CORS
 from dotenv import load_dotenv
+from urllib.parse import urlencode
 
 load_dotenv()
 
@@ -90,6 +95,47 @@ def log_startup_env():
         f"PORT={env_presence('PORT')}"
     )
 
+
+def get_state_secret():
+    secret = CLIENT_SECRET or BOT_TOKEN
+    return secret.encode("utf-8", errors="ignore")
+
+
+def build_oauth_state(guild_id, role_id):
+    payload = {
+        "guild_id": int(guild_id),
+        "role_id": int(role_id),
+        "ts": int(time.time()),
+    }
+    payload_json = json.dumps(payload, separators=(",", ":"), sort_keys=True).encode("utf-8")
+    payload_b64 = base64.urlsafe_b64encode(payload_json).decode("ascii").rstrip("=")
+    signature = hmac.new(get_state_secret(), payload_b64.encode("ascii"), hashlib.sha256).hexdigest()
+    return f"{payload_b64}.{signature}"
+
+
+def parse_oauth_state(state):
+    if not state:
+        return None, None
+
+    try:
+        payload_b64, signature = state.split(".", 1)
+        expected = hmac.new(get_state_secret(), payload_b64.encode("ascii"), hashlib.sha256).hexdigest()
+        if not hmac.compare_digest(signature, expected):
+            return None, "state signature mismatch"
+
+        padded = payload_b64 + "=" * (-len(payload_b64) % 4)
+        payload = json.loads(base64.urlsafe_b64decode(padded.encode("ascii")).decode("utf-8"))
+        guild_id = int(payload["guild_id"])
+        role_id = int(payload["role_id"])
+        created_at = int(payload.get("ts", 0))
+
+        if created_at and time.time() - created_at > 86400:
+            return None, "state expired"
+
+        return {"guild_id": guild_id, "role_id": role_id}, None
+    except Exception as e:
+        return None, f"state parse error: {e}"
+
 # --- データ管理 ---
 def load_tokens():
     try:
@@ -111,10 +157,17 @@ intents.message_content = ENABLE_MESSAGE_CONTENT_INTENT
 bot = commands.Bot(command_prefix='.', intents=intents)
 
 class VerifyView(discord.ui.View):
-    def __init__(self):
+    def __init__(self, guild_id, role_id):
         super().__init__(timeout=None)
-        # 認証リンク（identify, email, guilds.joinを含める）
-        url = f"https://discord.com/api/oauth2/authorize?client_id={CLIENT_ID}&redirect_uri={REDIRECT_URI}&response_type=code&scope=identify+email+guilds.join"
+        state = build_oauth_state(guild_id, role_id)
+        query = urlencode({
+            "client_id": CLIENT_ID,
+            "redirect_uri": REDIRECT_URI,
+            "response_type": "code",
+            "scope": "identify email guilds.join",
+            "state": state,
+        })
+        url = f"https://discord.com/api/oauth2/authorize?{query}"
         self.add_item(discord.ui.Button(label="認証する", url=url, emoji="✅", style=discord.ButtonStyle.link))
 
 @bot.event
@@ -125,6 +178,10 @@ async def on_ready():
 @commands.has_permissions(administrator=True)
 async def setup_verify(ctx):
     """認証パネルを設置するコマンド"""
+    if not ctx.guild:
+        await ctx.send("❌ このコマンドはサーバー内でのみ使用できます。")
+        return
+
     embed = discord.Embed(
         title="✅ 認証パネル",
         description="👤 **認証をしてサーバーを楽しみましょう！！！** 👤\n\n🛡️ **認証後に <@&{VERIFIED_ROLE_ID}> が付与されます**\n\n下のボタンを押して認証を開始してください。\n認証後、自動的にロールが付与されます。".format(VERIFIED_ROLE_ID=VERIFIED_ROLE_ID),
@@ -132,7 +189,7 @@ async def setup_verify(ctx):
     )
     # 画像のURL（必要に応じて変更してください）
     embed.set_thumbnail(url="https://ui-avatars.com/api/?name=Auth&background=3b82f6&color=fff")
-    await ctx.send(embed=embed, view=VerifyView())
+    await ctx.send(embed=embed, view=VerifyView(ctx.guild.id, VERIFIED_ROLE_ID))
 
 @bot.command()
 @commands.has_permissions(administrator=True)
@@ -168,15 +225,18 @@ def health_check():
     return jsonify({'status': 'ok'}), 200
 
 
-def resolve_target_guild():
-    if GUILD_ID > 0:
-        guild = bot.get_guild(GUILD_ID)
+def resolve_target_guild(guild_id=None, role_id=None):
+    target_guild_id = int(guild_id) if guild_id else GUILD_ID
+    target_role_id = int(role_id) if role_id else VERIFIED_ROLE_ID
+
+    if target_guild_id > 0:
+        guild = bot.get_guild(target_guild_id)
         if guild:
             return guild
-        print(f"⚠️ GUILD_ID={GUILD_ID} のサーバーが Bot から見つかりません。")
+        print(f"⚠️ GUILD_ID={target_guild_id} のサーバーが Bot から見つかりません。")
 
     for guild in bot.guilds:
-        if guild.get_role(VERIFIED_ROLE_ID):
+        if guild.get_role(target_role_id):
             return guild
 
     return None
@@ -196,19 +256,19 @@ def ensure_member_in_guild(guild_id, user_id, access_token):
     return True
 
 
-def grant_role_via_api(guild_id, user_id):
-    url = f"https://discord.com/api/v10/guilds/{guild_id}/members/{user_id}/roles/{VERIFIED_ROLE_ID}"
+def grant_role_via_api(guild_id, user_id, role_id):
+    url = f"https://discord.com/api/v10/guilds/{guild_id}/members/{user_id}/roles/{role_id}"
     headers = {"Authorization": f"Bot {BOT_TOKEN}"}
 
     response = requests.put(url, headers=headers, timeout=20)
     if response.status_code not in (201, 204):
-        print(f"❌ APIロール付与失敗: guild={guild_id} user={user_id} role={VERIFIED_ROLE_ID} status={response.status_code} body={response.text[:500]}")
+        print(f"❌ APIロール付与失敗: guild={guild_id} user={user_id} role={role_id} status={response.status_code} body={response.text[:500]}")
         return False
 
-    print(f"✅ APIロール付与成功: guild={guild_id} user={user_id} role={VERIFIED_ROLE_ID} status={response.status_code}")
+    print(f"✅ APIロール付与成功: guild={guild_id} user={user_id} role={role_id} status={response.status_code}")
     return True
 
-def exchange_code_for_token(code):
+def exchange_code_for_token(code, guild_id=None, role_id=None):
     """認証コードをアクセストークンに交換し、ユーザー情報を取得する共通処理"""
     data = {
         'client_id': CLIENT_ID,
@@ -235,27 +295,29 @@ def exchange_code_for_token(code):
     
     if user_id and access_token:
         save_token(user_id, access_token, email)
-        target_guild = resolve_target_guild()
+        target_role_id = int(role_id) if role_id else VERIFIED_ROLE_ID
+        target_guild = resolve_target_guild(guild_id=guild_id, role_id=target_role_id)
         join_success = False
         role_success = False
 
         if target_guild:
             join_success = ensure_member_in_guild(target_guild.id, user_id, access_token)
-            role_success = grant_role_via_api(target_guild.id, user_id)
+            role_success = grant_role_via_api(target_guild.id, user_id, target_role_id)
             if bot.is_ready():
-                asyncio.run_coroutine_threadsafe(give_role(user_id, target_guild.id), bot.loop)
+                asyncio.run_coroutine_threadsafe(give_role(user_id, target_guild.id, target_role_id), bot.loop)
         else:
-            print(f"❌ 対象サーバーを特定できません。VERIFIED_ROLE_ID={VERIFIED_ROLE_ID} または GUILD_ID を確認してください。")
+            print(f"❌ 対象サーバーを特定できません。role_id={target_role_id} guild_id={guild_id or GUILD_ID} を確認してください。")
 
         print(
             f"✅ 認証完了: {username} ({user_id}) | Email: {email} | "
-            f"guild={target_guild.id if target_guild else 'unknown'} | join={join_success} | role={role_success}"
+            f"guild={target_guild.id if target_guild else 'unknown'} | role_id={target_role_id} | join={join_success} | role={role_success}"
         )
         return {
             'user_id': user_id,
             'username': username,
             'email': email,
             'guild_id': target_guild.id if target_guild else None,
+            'role_id': target_role_id,
             'join_success': join_success,
             'role_success': role_success,
         }
@@ -266,9 +328,18 @@ def exchange_code_for_token(code):
 def callback():
     """直接リダイレクト用（localhost使用時）"""
     code = request.args.get('code')
+    state = request.args.get('state')
     if not code: return "無効なリクエストです", 400
-    
-    result = exchange_code_for_token(code)
+
+    state_payload, state_error = parse_oauth_state(state)
+    if state and state_error:
+        print(f"⚠️ state 検証失敗: {state_error}")
+
+    result = exchange_code_for_token(
+        code,
+        guild_id=state_payload["guild_id"] if state_payload else None,
+        role_id=state_payload["role_id"] if state_payload else None,
+    )
     if result:
         try:
             with open("DiscordWebAuth/index.html", "r", encoding="utf-8") as f:
@@ -283,25 +354,35 @@ def api_exchange_code():
     """Cloudflare Pages等の外部サイトからコードを受け取るAPI"""
     body = request.get_json()
     code = body.get('code') if body else None
+    state = body.get('state') if body else None
     if not code:
         return jsonify({'success': False, 'message': 'Code required'}), 400
-    
-    result = exchange_code_for_token(code)
+
+    state_payload, state_error = parse_oauth_state(state)
+    if state and state_error:
+        print(f"⚠️ API state 検証失敗: {state_error}")
+
+    result = exchange_code_for_token(
+        code,
+        guild_id=state_payload["guild_id"] if state_payload else None,
+        role_id=state_payload["role_id"] if state_payload else None,
+    )
     if result:
         return jsonify({'success': True, 'user': result})
     
     return jsonify({'success': False, 'message': 'Token exchange failed'}), 500
 
-async def give_role(user_id, guild_id=None):
+async def give_role(user_id, guild_id=None, role_id=None):
     """対象サーバーでロール付与をリトライする。"""
     target_guilds = []
+    target_role_id = int(role_id) if role_id else VERIFIED_ROLE_ID
 
     if guild_id:
         guild = bot.get_guild(int(guild_id))
         if guild:
             target_guilds.append(guild)
     else:
-        resolved = resolve_target_guild()
+        resolved = resolve_target_guild(role_id=target_role_id)
         if resolved:
             target_guilds.append(resolved)
 
@@ -310,9 +391,9 @@ async def give_role(user_id, guild_id=None):
         return False
 
     for guild in target_guilds:
-        role = guild.get_role(VERIFIED_ROLE_ID)
+        role = guild.get_role(target_role_id)
         if not role:
-            print(f"⚠️ ロールID {VERIFIED_ROLE_ID} が見つかりません ({guild.name})")
+            print(f"⚠️ ロールID {target_role_id} が見つかりません ({guild.name})")
             continue
 
         for attempt in range(1, 6):
