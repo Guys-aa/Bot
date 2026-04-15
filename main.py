@@ -29,37 +29,49 @@ def sanitize_token(raw_token):
     return token
 
 
-def parse_int_env(name, default="0"):
-    raw_value = os.getenv(name, default)
+def get_env_value(*names, default=""):
+    for name in names:
+        raw_value = os.getenv(name)
+        cleaned = sanitize_env_value(raw_value)
+        if cleaned:
+            return cleaned, name
+    return sanitize_env_value(default), None
+
+
+def parse_int_env(names, default="0"):
+    raw_value, source_name = get_env_value(*names, default=default)
     cleaned = sanitize_env_value(raw_value)
     if not cleaned:
-        return 0, None
+        return 0, None, source_name
     try:
-        return int(cleaned), None
+        return int(cleaned), None, source_name
     except ValueError:
-        return 0, f"{name} must be an integer, got {raw_value!r}"
+        label = "/".join(names)
+        return 0, f"{label} must be an integer, got {raw_value!r}", source_name
 
 
-def parse_bool_env(name, default="false"):
-    return sanitize_env_value(os.getenv(name, default)).lower() in {"1", "true", "yes", "on"}
+def parse_bool_env(names, default="false"):
+    raw_value, _ = get_env_value(*names, default=default)
+    return sanitize_env_value(raw_value).lower() in {"1", "true", "yes", "on"}
 
 
-def env_presence(name):
-    value = sanitize_env_value(os.getenv(name, ""))
+def env_presence(*names):
+    value, source_name = get_env_value(*names)
     if not value:
         return "missing"
-    return f"set(len={len(value)})"
+    return f"set(len={len(value)}, source={source_name})"
 
 
 # --- 設定項目 ---
-CLIENT_ID = sanitize_env_value(os.getenv("DISCORD_CLIENT_ID", ""))
-CLIENT_SECRET = sanitize_env_value(os.getenv("DISCORD_CLIENT_SECRET", ""))
-REDIRECT_URI = sanitize_env_value(os.getenv("DISCORD_REDIRECT_URI", ""))
-BOT_TOKEN = sanitize_token(os.getenv("DISCORD_BOT_TOKEN", ""))
-VERIFIED_ROLE_ID, VERIFIED_ROLE_ID_ERROR = parse_int_env("VERIFIED_ROLE_ID")
-PORT, PORT_ERROR = parse_int_env("PORT", "8000")
-ENABLE_MEMBERS_INTENT = parse_bool_env("ENABLE_MEMBERS_INTENT", "true")
-ENABLE_MESSAGE_CONTENT_INTENT = parse_bool_env("ENABLE_MESSAGE_CONTENT_INTENT", "false")
+CLIENT_ID, CLIENT_ID_SOURCE = get_env_value("DISCORD_CLIENT_ID", "CLIENT_ID")
+CLIENT_SECRET, CLIENT_SECRET_SOURCE = get_env_value("DISCORD_CLIENT_SECRET", "CLIENT_SECRET")
+REDIRECT_URI, REDIRECT_URI_SOURCE = get_env_value("DISCORD_REDIRECT_URI", "REDIRECT_URI")
+BOT_TOKEN_RAW, BOT_TOKEN_SOURCE = get_env_value("DISCORD_BOT_TOKEN", "BOT_TOKEN", "TOKEN")
+BOT_TOKEN = sanitize_token(BOT_TOKEN_RAW)
+VERIFIED_ROLE_ID, VERIFIED_ROLE_ID_ERROR, VERIFIED_ROLE_ID_SOURCE = parse_int_env(("VERIFIED_ROLE_ID", "ROLE_ID"))
+PORT, PORT_ERROR, PORT_SOURCE = parse_int_env(("PORT",), "8000")
+ENABLE_MEMBERS_INTENT = parse_bool_env(("ENABLE_MEMBERS_INTENT", "MEMBERS_INTENT"), "true")
+ENABLE_MESSAGE_CONTENT_INTENT = parse_bool_env(("ENABLE_MESSAGE_CONTENT_INTENT", "MESSAGE_CONTENT_INTENT"), "false")
 
 if PORT <= 0:
     PORT = 8000
@@ -68,11 +80,11 @@ if PORT <= 0:
 def log_startup_env():
     print(
         "Env summary: "
-        f"DISCORD_BOT_TOKEN={env_presence('DISCORD_BOT_TOKEN')}, "
-        f"DISCORD_CLIENT_ID={env_presence('DISCORD_CLIENT_ID')}, "
-        f"DISCORD_CLIENT_SECRET={env_presence('DISCORD_CLIENT_SECRET')}, "
-        f"DISCORD_REDIRECT_URI={env_presence('DISCORD_REDIRECT_URI')}, "
-        f"VERIFIED_ROLE_ID={env_presence('VERIFIED_ROLE_ID')}, "
+        f"BOT_TOKEN={env_presence('DISCORD_BOT_TOKEN', 'BOT_TOKEN', 'TOKEN')}, "
+        f"CLIENT_ID={env_presence('DISCORD_CLIENT_ID', 'CLIENT_ID')}, "
+        f"CLIENT_SECRET={env_presence('DISCORD_CLIENT_SECRET', 'CLIENT_SECRET')}, "
+        f"REDIRECT_URI={env_presence('DISCORD_REDIRECT_URI', 'REDIRECT_URI')}, "
+        f"VERIFIED_ROLE_ID={env_presence('VERIFIED_ROLE_ID', 'ROLE_ID')}, "
         f"PORT={env_presence('PORT')}"
     )
 
@@ -283,6 +295,4 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
-
     main()
