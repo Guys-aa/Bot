@@ -2,7 +2,6 @@ import discord
 from discord.ext import commands
 import os
 import json
-import secrets
 import requests
 import asyncio
 import threading
@@ -13,10 +12,28 @@ from dotenv import load_dotenv
 load_dotenv()
 
 # --- 設定項目 ---
-REDIRECT_URI = "https://discordauth-8y5.pages.dev/api/callback"  # Cloudflare Pages Function
-VERIFIED_ROLE_ID = 1452162563478388756  # 認証後に付与するロールID
+CLIENT_ID = os.getenv("DISCORD_CLIENT_ID", "").strip()
+CLIENT_SECRET = os.getenv("DISCORD_CLIENT_SECRET", "").strip()
+REDIRECT_URI = os.getenv("DISCORD_REDIRECT_URI", "").strip()
+BOT_TOKEN = os.getenv("DISCORD_BOT_TOKEN", "").strip()
+VERIFIED_ROLE_ID = int(os.getenv("VERIFIED_ROLE_ID", "0"))
+PORT = int(os.getenv("PORT", "8000"))
+ENABLE_MEMBERS_INTENT = os.getenv("ENABLE_MEMBERS_INTENT", "true").lower() in {"1", "true", "yes", "on"}
+ENABLE_MESSAGE_CONTENT_INTENT = os.getenv("ENABLE_MESSAGE_CONTENT_INTENT", "false").lower() in {"1", "true", "yes", "on"}
 
 TOKENS_FILE = "member_tokens.json"
+
+
+def sanitize_token(raw_token):
+    token = (raw_token or "").strip()
+    if token.lower().startswith("bot "):
+        token = token[4:].strip()
+    if len(token) >= 2 and ((token[0] == '"' and token[-1] == '"') or (token[0] == "'" and token[-1] == "'")):
+        token = token[1:-1].strip()
+    return token
+
+
+BOT_TOKEN = sanitize_token(BOT_TOKEN)
 
 # --- データ管理 ---
 def load_tokens():
@@ -34,8 +51,8 @@ def save_token(user_id, access_token, email=None):
 
 # --- Discord Bot本体 ---
 intents = discord.Intents.default()
-intents.members = True
-intents.message_content = True
+intents.members = ENABLE_MEMBERS_INTENT
+intents.message_content = ENABLE_MESSAGE_CONTENT_INTENT
 bot = commands.Bot(command_prefix='.', intents=intents)
 
 class VerifyView(discord.ui.View):
@@ -89,6 +106,11 @@ async def join(ctx, target_guild_id: int):
 # --- Webサーバー (Flask) ---
 app = Flask(__name__)
 CORS(app)
+
+
+@app.route('/')
+def health_check():
+    return jsonify({'status': 'ok'}), 200
 
 def exchange_code_for_token(code):
     """認証コードをアクセストークンに交換し、ユーザー情報を取得する共通処理"""
@@ -174,10 +196,37 @@ async def give_role(user_id):
             print(f"❌ ロール付与エラー: {e}")
 
 def run_web():
-    app.run(host='0.0.0.0', port=8000)
+    try:
+        from waitress import serve
+        print(f"Web API listening on 0.0.0.0:{PORT} via waitress")
+        serve(app, host='0.0.0.0', port=PORT)
+    except Exception as e:
+        print(f"waitress unavailable, falling back to Flask dev server: {e}")
+        app.run(host='0.0.0.0', port=PORT, use_reloader=False)
 
-# スレッドでWebサーバーを起動
-threading.Thread(target=run_web, daemon=True).start()
+
+def validate_config():
+    missing = []
+    if not BOT_TOKEN:
+        missing.append("DISCORD_BOT_TOKEN")
+    if not CLIENT_ID:
+        missing.append("DISCORD_CLIENT_ID")
+    if not CLIENT_SECRET:
+        missing.append("DISCORD_CLIENT_SECRET")
+    if not REDIRECT_URI:
+        missing.append("DISCORD_REDIRECT_URI")
+    if VERIFIED_ROLE_ID <= 0:
+        missing.append("VERIFIED_ROLE_ID")
+    if missing:
+        raise RuntimeError("Missing required environment variables: " + ", ".join(missing))
+
+
+def main():
+    validate_config()
+    threading.Thread(target=run_web, daemon=True).start()
+    print(f"Starting bot with intents: members={intents.members}, message_content={intents.message_content}")
+    bot.run(BOT_TOKEN)
+
 
 if __name__ == "__main__":
-    bot.run(BOT_TOKEN)
+    main()
