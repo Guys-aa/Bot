@@ -18,6 +18,7 @@ from urllib.parse import urlencode
 load_dotenv()
 
 TOKENS_FILE = "member_tokens.json"
+PAYPAY_CHANNEL_FILE = "paypay_notify_channel.json"
 
 
 def sanitize_env_value(raw_value):
@@ -150,11 +151,35 @@ def save_token(user_id, access_token, email=None):
     }
     with open(TOKENS_FILE, "w") as f: json.dump(tokens, f, indent=4)
 
+
+def load_paypay_notify_channels():
+    try:
+        with open(PAYPAY_CHANNEL_FILE, "r", encoding="utf-8") as f:
+            raw = json.load(f)
+            return {int(k): int(v) for k, v in raw.items()}
+    except FileNotFoundError:
+        return {}
+    except Exception as e:
+        print(f"⚠️ PayPay通知チャンネル設定の読み込みに失敗しました: {e}")
+        return {}
+
+
+def persist_paypay_notify_channel(guild_id, channel_id):
+    data = load_paypay_notify_channels()
+    data[int(guild_id)] = int(channel_id)
+    with open(PAYPAY_CHANNEL_FILE, "w", encoding="utf-8") as f:
+        json.dump({str(k): v for k, v in data.items()}, f, indent=2)
+
+
+def get_paypay_notify_channel_id(guild_id):
+    return load_paypay_notify_channels().get(int(guild_id))
+
 # --- Discord Bot本体 ---
 intents = discord.Intents.default()
 intents.members = ENABLE_MEMBERS_INTENT
 intents.message_content = ENABLE_MESSAGE_CONTENT_INTENT
 bot = commands.Bot(command_prefix='.', intents=intents)
+persistent_views_registered = False
 
 
 def is_supported_image_attachment(attachment):
@@ -178,6 +203,81 @@ class VerifyView(discord.ui.View):
         })
         url = f"https://discord.com/api/oauth2/authorize?{query}"
         self.add_item(discord.ui.Button(label="認証する", url=url, emoji="✅", style=discord.ButtonStyle.link))
+
+
+class PayPayPurchaseModal(discord.ui.Modal):
+    def __init__(self, product_title):
+        super().__init__(title="PayPayリンクを送信")
+        self.product_title = product_title[:256]
+        self.paypay_link = discord.ui.TextInput(
+            label="PayPayリンク",
+            placeholder="https://pay.paypay.ne.jp/...",
+            style=discord.TextStyle.short,
+            required=True,
+            max_length=500,
+        )
+        self.add_item(self.paypay_link)
+
+    async def on_submit(self, interaction):
+        guild = interaction.guild
+        if guild is None:
+            await interaction.response.send_message("❌ この操作はサーバー内でのみ利用できます。", ephemeral=True)
+            return
+
+        notify_channel_id = get_paypay_notify_channel_id(guild.id)
+        if not notify_channel_id:
+            await interaction.response.send_message("❌ 管理者が PayPay 受け取りチャンネルを設定していません。", ephemeral=True)
+            return
+
+        notify_channel = guild.get_channel(notify_channel_id)
+        if not isinstance(notify_channel, discord.TextChannel):
+            await interaction.response.send_message("❌ 設定された PayPay 受け取りチャンネルが見つかりません。", ephemeral=True)
+            return
+
+        me = guild.get_member(bot.user.id) if bot.user else None
+        if me and not notify_channel.permissions_for(me).send_messages:
+            await interaction.response.send_message("❌ Bot が PayPay 受け取りチャンネルへ送信できません。", ephemeral=True)
+            return
+
+        embed = discord.Embed(
+            title="PayPay購入申請",
+            color=0x00B140,
+            timestamp=discord.utils.utcnow(),
+        )
+        embed.add_field(name="購入者", value=f"{interaction.user.mention} (`{interaction.user.id}`)", inline=False)
+        embed.add_field(name="商品", value=self.product_title, inline=False)
+        embed.add_field(name="PayPayリンク", value=f"```{self.paypay_link.value.strip()}```", inline=False)
+        if interaction.channel is not None:
+            embed.add_field(name="送信元チャンネル", value=interaction.channel.mention, inline=True)
+        if interaction.message is not None:
+            embed.add_field(name="元メッセージ", value=f"[開く]({interaction.message.jump_url})", inline=True)
+
+        await notify_channel.send(embed=embed)
+        await interaction.response.send_message(
+            f"✅ PayPayリンクを {notify_channel.mention} に送信しました。確認をお待ちください。",
+            ephemeral=True,
+        )
+
+
+class PayPayShopView(discord.ui.View):
+    def __init__(self):
+        super().__init__(timeout=None)
+
+    @discord.ui.button(
+        label="購入する",
+        style=discord.ButtonStyle.success,
+        custom_id="paypay_shop_buy_button",
+    )
+    async def buy(self, interaction, button):
+        if interaction.guild is None:
+            await interaction.response.send_message("❌ この操作はサーバー内でのみ利用できます。", ephemeral=True)
+            return
+
+        product_title = "ショップ商品"
+        if interaction.message and interaction.message.embeds:
+            product_title = interaction.message.embeds[0].title or product_title
+
+        await interaction.response.send_modal(PayPayPurchaseModal(product_title))
 
 
 class SetupVerifyConfigView(discord.ui.View):
@@ -247,7 +347,36 @@ class SetupVerifyConfigView(discord.ui.View):
 
 @bot.event
 async def on_ready():
+    global persistent_views_registered
+
+    if not persistent_views_registered:
+        bot.add_view(PayPayShopView())
+        persistent_views_registered = True
+
+    # スラッシュコマンドを同期
+    try:
+        synced = await bot.tree.sync()
+        print(f"✅ {len(synced)}個のスラッシュコマンドを同期しました")
+    except Exception as e:
+        print(f"⚠️ コマンド同期エラー: {e}")
+
     print(f"✅ Bot Logged in as {bot.user}")
+
+
+@bot.event
+async def on_command_error(ctx, error):
+    if isinstance(error, commands.MissingPermissions):
+        await ctx.send("❌ このコマンドは管理者のみ使用できます。")
+        return
+    if isinstance(error, commands.MissingRequiredArgument):
+        await ctx.send(f"❌ 引数が不足しています。使い方: `{ctx.prefix}{ctx.command} {ctx.command.signature}`")
+        return
+    if isinstance(error, commands.BadArgument):
+        await ctx.send("❌ 引数の形式が正しくありません。チャンネル指定などを確認してください。")
+        return
+    if isinstance(error, commands.CommandNotFound):
+        return
+    print(f"⚠️ コマンドエラー: {error}")
 
 @bot.command()
 @commands.has_permissions(administrator=True)
@@ -281,6 +410,73 @@ async def setup_verify(ctx):
         embed=embed,
         view=SetupVerifyConfigView(ctx.author.id, ctx.guild.id, image_attachment=image_attachment),
     )
+
+
+@bot.command()
+@commands.has_permissions(administrator=True)
+async def set_paypay_channel(ctx, channel: discord.TextChannel):
+    """PayPay受け取りチャンネルを設定するコマンド"""
+    if not ctx.guild:
+        await ctx.send("❌ このコマンドはサーバー内でのみ使用できます。")
+        return
+
+    persist_paypay_notify_channel(ctx.guild.id, channel.id)
+    await ctx.send(f"✅ PayPay受け取りチャンネルを {channel.mention} に設定しました。")
+
+
+@bot.tree.command(name="setup_shop", description="購入ボタン付きの商品パネルを設置します")
+@discord.app_commands.checks.has_permissions(administrator=True)
+@discord.app_commands.describe(
+    title="商品名",
+    description="商品の説明",
+    price="価格（例: ¥1500）",
+    image="商品画像（任意）",
+)
+async def setup_shop(
+    interaction: discord.Interaction,
+    title: str,
+    description: str,
+    price: str,
+    image: discord.Attachment = None,
+):
+    """購入ボタン付きのショップパネルを設置するコマンド"""
+    if not interaction.guild:
+        await interaction.response.send_message("❌ このコマンドはサーバー内でのみ使用できます。", ephemeral=True)
+        return
+
+    notify_channel_id = get_paypay_notify_channel_id(interaction.guild.id)
+    if not notify_channel_id:
+        await interaction.response.send_message("❌ 先に `.set_paypay_channel #チャンネル` で受け取り先を設定してください。", ephemeral=True)
+        return
+
+    if image and not is_supported_image_attachment(image):
+        await interaction.response.send_message("❌ 添付ファイルは画像のみ対応です。png / jpg / jpeg / gif / webp を使ってください。", ephemeral=True)
+        return
+
+    await interaction.response.defer(ephemeral=True)
+
+    embed = discord.Embed(
+        title=title[:256],
+        description=description[:4096],
+        color=0x00B140,
+    )
+    embed.add_field(name="💰 価格", value=f"**{price}**", inline=True)
+    embed.add_field(name="💳 支払い方法", value="PayPayリンク", inline=True)
+    embed.add_field(name="📢 通知先", value=f"<#{notify_channel_id}>", inline=True)
+    embed.set_footer(text="購入後に管理者の確認をお待ちください。")
+
+    send_kwargs = {
+        "embed": embed,
+        "view": PayPayShopView(),
+    }
+
+    if image:
+        image_file = await image.to_file()
+        embed.set_image(url=f"attachment://{image_file.filename}")
+        send_kwargs["file"] = image_file
+
+    await interaction.channel.send(**send_kwargs)
+    await interaction.followup.send("✅ 商品パネルを投稿しました。", ephemeral=True)
 
 @bot.command()
 @commands.has_permissions(administrator=True)
