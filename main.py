@@ -13,6 +13,7 @@ from dotenv import load_dotenv
 load_dotenv()
 
 # --- 設定項目 ---
+REDIRECT_URI = "https://discordauth-8y5.pages.dev/api/callback"  # Cloudflare Pages Function
 VERIFIED_ROLE_ID = 1452162563478388756  # 認証後に付与するロールID
 
 TOKENS_FILE = "member_tokens.json"
