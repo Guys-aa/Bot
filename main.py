@@ -205,10 +205,127 @@ class VerifyView(discord.ui.View):
         self.add_item(discord.ui.Button(label="認証する", url=url, emoji="✅", style=discord.ButtonStyle.link))
 
 
+class OrderReviewView(discord.ui.View):
+    """管理者用の承認/拒否ボタン付きView"""
+    def __init__(self):
+        super().__init__(timeout=None)
+
+    @discord.ui.button(
+        label="承認して商品を送る",
+        style=discord.ButtonStyle.success,
+        custom_id="order_review_accept",
+        emoji="✅",
+    )
+    async def accept(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if not interaction.user.guild_permissions.administrator:
+            await interaction.response.send_message("❌ 管理者のみ操作できます。", ephemeral=True)
+            return
+
+        embed = interaction.message.embeds[0] if interaction.message.embeds else None
+        if not embed:
+            await interaction.response.send_message("❌ 注文情報が見つかりません。", ephemeral=True)
+            return
+
+        # 購入者IDをembedから取得
+        buyer_id = None
+        product_title = "商品"
+        product_link = None
+        for field in embed.fields:
+            if field.name == "購入者":
+                # フォーマット: @mention (`ID`)
+                import re
+                match = re.search(r'`(\d+)`', field.value)
+                if match:
+                    buyer_id = int(match.group(1))
+            elif field.name == "商品":
+                product_title = field.value
+            elif field.name == "🔗 商品リンク":
+                product_link = field.value
+
+        if not buyer_id:
+            await interaction.response.send_message("❌ 購入者を特定できませんでした。", ephemeral=True)
+            return
+
+        # 購入者にDMを送信
+        try:
+            buyer = await bot.fetch_user(buyer_id)
+            dm_embed = discord.Embed(
+                title="✅ 購入が承認されました",
+                description=f"**{product_title}** の購入が承認されました！",
+                color=0x22c55e,
+                timestamp=discord.utils.utcnow(),
+            )
+            dm_embed.add_field(name="承認者", value=interaction.user.display_name, inline=True)
+            if product_link:
+                dm_embed.add_field(name="🔗 商品リンク", value=product_link, inline=False)
+            dm_embed.set_footer(text="ご購入ありがとうございます！")
+            await buyer.send(embed=dm_embed)
+        except Exception as e:
+            print(f"⚠️ DM送信失敗: {e}")
+
+        # embedを更新
+        embed.color = 0x22c55e
+        embed.set_footer(text=f"✅ {interaction.user.display_name} が承認しました")
+        for child in self.children:
+            child.disabled = True
+        await interaction.response.edit_message(embed=embed, view=self)
+
+    @discord.ui.button(
+        label="拒否する",
+        style=discord.ButtonStyle.danger,
+        custom_id="order_review_reject",
+        emoji="❌",
+    )
+    async def reject(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if not interaction.user.guild_permissions.administrator:
+            await interaction.response.send_message("❌ 管理者のみ操作できます。", ephemeral=True)
+            return
+
+        embed = interaction.message.embeds[0] if interaction.message.embeds else None
+        if not embed:
+            await interaction.response.send_message("❌ 注文情報が見つかりません。", ephemeral=True)
+            return
+
+        # 購入者IDを取得
+        buyer_id = None
+        product_title = "商品"
+        for field in embed.fields:
+            if field.name == "購入者":
+                import re
+                match = re.search(r'`(\d+)`', field.value)
+                if match:
+                    buyer_id = int(match.group(1))
+            elif field.name == "商品":
+                product_title = field.value
+
+        if buyer_id:
+            try:
+                buyer = await bot.fetch_user(buyer_id)
+                dm_embed = discord.Embed(
+                    title="❌ 購入が拒否されました",
+                    description=f"**{product_title}** の購入申請は拒否されました。",
+                    color=0xef4444,
+                    timestamp=discord.utils.utcnow(),
+                )
+                dm_embed.add_field(name="担当者", value=interaction.user.display_name, inline=True)
+                dm_embed.set_footer(text="ご不明な点がございましたら管理者にお問い合わせください。")
+                await buyer.send(embed=dm_embed)
+            except Exception as e:
+                print(f"⚠️ DM送信失敗: {e}")
+
+        # embedを更新
+        embed.color = 0xef4444
+        embed.set_footer(text=f"❌ {interaction.user.display_name} が拒否しました")
+        for child in self.children:
+            child.disabled = True
+        await interaction.response.edit_message(embed=embed, view=self)
+
+
 class PayPayPurchaseModal(discord.ui.Modal):
-    def __init__(self, product_title):
+    def __init__(self, product_title, product_link=None):
         super().__init__(title="PayPayリンクを送信")
         self.product_title = product_title[:256]
+        self.product_link = product_link
         self.paypay_link = discord.ui.TextInput(
             label="PayPayリンク",
             placeholder="https://pay.paypay.ne.jp/...",
@@ -240,19 +357,22 @@ class PayPayPurchaseModal(discord.ui.Modal):
             return
 
         embed = discord.Embed(
-            title="PayPay購入申請",
-            color=0x00B140,
+            title="📋 PayPay購入申請",
+            color=0xFFA500,
             timestamp=discord.utils.utcnow(),
         )
         embed.add_field(name="購入者", value=f"{interaction.user.mention} (`{interaction.user.id}`)", inline=False)
         embed.add_field(name="商品", value=self.product_title, inline=False)
         embed.add_field(name="PayPayリンク", value=f"```{self.paypay_link.value.strip()}```", inline=False)
+        if self.product_link:
+            embed.add_field(name="🔗 商品リンク", value=self.product_link, inline=False)
         if interaction.channel is not None:
             embed.add_field(name="送信元チャンネル", value=interaction.channel.mention, inline=True)
         if interaction.message is not None:
             embed.add_field(name="元メッセージ", value=f"[開く]({interaction.message.jump_url})", inline=True)
+        embed.set_footer(text="⏳ 審査待ち")
 
-        await notify_channel.send(embed=embed)
+        await notify_channel.send(embed=embed, view=OrderReviewView())
         await interaction.response.send_message(
             f"✅ PayPayリンクを {notify_channel.mention} に送信しました。確認をお待ちください。",
             ephemeral=True,
@@ -274,10 +394,16 @@ class PayPayShopView(discord.ui.View):
             return
 
         product_title = "ショップ商品"
+        product_link = None
         if interaction.message and interaction.message.embeds:
-            product_title = interaction.message.embeds[0].title or product_title
+            emb = interaction.message.embeds[0]
+            product_title = emb.title or product_title
+            # embedから商品リンクを取得
+            for field in emb.fields:
+                if field.name == "🔗 購入リンク":
+                    product_link = field.value
 
-        await interaction.response.send_modal(PayPayPurchaseModal(product_title))
+        await interaction.response.send_modal(PayPayPurchaseModal(product_title, product_link))
 
 
 class SetupVerifyConfigView(discord.ui.View):
@@ -351,6 +477,7 @@ async def on_ready():
 
     if not persistent_views_registered:
         bot.add_view(PayPayShopView())
+        bot.add_view(OrderReviewView())
         persistent_views_registered = True
 
     # スラッシュコマンドを同期
@@ -430,6 +557,7 @@ async def set_paypay_channel(ctx, channel: discord.TextChannel):
     title="商品名",
     description="商品の説明",
     price="価格（例: ¥1500）",
+    link="商品の購入/ダウンロードリンク（任意・承認時に購入者へ送信されます）",
     image="商品画像（任意）",
 )
 async def setup_shop(
@@ -437,6 +565,7 @@ async def setup_shop(
     title: str,
     description: str,
     price: str,
+    link: str = None,
     image: discord.Attachment = None,
 ):
     """購入ボタン付きのショップパネルを設置するコマンド"""
@@ -463,6 +592,8 @@ async def setup_shop(
     embed.add_field(name="💰 価格", value=f"**{price}**", inline=True)
     embed.add_field(name="💳 支払い方法", value="PayPayリンク", inline=True)
     embed.add_field(name="📢 通知先", value=f"<#{notify_channel_id}>", inline=True)
+    if link:
+        embed.add_field(name="🔗 購入リンク", value=link, inline=False)
     embed.set_footer(text="購入後に管理者の確認をお待ちください。")
 
     send_kwargs = {
