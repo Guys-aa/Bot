@@ -5,35 +5,76 @@ import json
 import requests
 import asyncio
 import threading
+import traceback
 from flask import Flask, request, jsonify
 from flask_cors import CORS
 from dotenv import load_dotenv
 
 load_dotenv()
 
-# --- 設定項目 ---
-CLIENT_ID = os.getenv("DISCORD_CLIENT_ID", "").strip()
-CLIENT_SECRET = os.getenv("DISCORD_CLIENT_SECRET", "").strip()
-REDIRECT_URI = os.getenv("DISCORD_REDIRECT_URI", "").strip()
-BOT_TOKEN = os.getenv("DISCORD_BOT_TOKEN", "").strip()
-VERIFIED_ROLE_ID = int(os.getenv("VERIFIED_ROLE_ID", "0"))
-PORT = int(os.getenv("PORT", "8000"))
-ENABLE_MEMBERS_INTENT = os.getenv("ENABLE_MEMBERS_INTENT", "true").lower() in {"1", "true", "yes", "on"}
-ENABLE_MESSAGE_CONTENT_INTENT = os.getenv("ENABLE_MESSAGE_CONTENT_INTENT", "false").lower() in {"1", "true", "yes", "on"}
-
 TOKENS_FILE = "member_tokens.json"
 
 
+def sanitize_env_value(raw_value):
+    value = (raw_value or "").strip()
+    if len(value) >= 2 and ((value[0] == '"' and value[-1] == '"') or (value[0] == "'" and value[-1] == "'")):
+        value = value[1:-1].strip()
+    return value
+
+
 def sanitize_token(raw_token):
-    token = (raw_token or "").strip()
+    token = sanitize_env_value(raw_token)
     if token.lower().startswith("bot "):
         token = token[4:].strip()
-    if len(token) >= 2 and ((token[0] == '"' and token[-1] == '"') or (token[0] == "'" and token[-1] == "'")):
-        token = token[1:-1].strip()
     return token
 
 
-BOT_TOKEN = sanitize_token(BOT_TOKEN)
+def parse_int_env(name, default="0"):
+    raw_value = os.getenv(name, default)
+    cleaned = sanitize_env_value(raw_value)
+    if not cleaned:
+        return 0, None
+    try:
+        return int(cleaned), None
+    except ValueError:
+        return 0, f"{name} must be an integer, got {raw_value!r}"
+
+
+def parse_bool_env(name, default="false"):
+    return sanitize_env_value(os.getenv(name, default)).lower() in {"1", "true", "yes", "on"}
+
+
+def env_presence(name):
+    value = sanitize_env_value(os.getenv(name, ""))
+    if not value:
+        return "missing"
+    return f"set(len={len(value)})"
+
+
+# --- 設定項目 ---
+CLIENT_ID = sanitize_env_value(os.getenv("DISCORD_CLIENT_ID", ""))
+CLIENT_SECRET = sanitize_env_value(os.getenv("DISCORD_CLIENT_SECRET", ""))
+REDIRECT_URI = sanitize_env_value(os.getenv("DISCORD_REDIRECT_URI", ""))
+BOT_TOKEN = sanitize_token(os.getenv("DISCORD_BOT_TOKEN", ""))
+VERIFIED_ROLE_ID, VERIFIED_ROLE_ID_ERROR = parse_int_env("VERIFIED_ROLE_ID")
+PORT, PORT_ERROR = parse_int_env("PORT", "8000")
+ENABLE_MEMBERS_INTENT = parse_bool_env("ENABLE_MEMBERS_INTENT", "true")
+ENABLE_MESSAGE_CONTENT_INTENT = parse_bool_env("ENABLE_MESSAGE_CONTENT_INTENT", "false")
+
+if PORT <= 0:
+    PORT = 8000
+
+
+def log_startup_env():
+    print(
+        "Env summary: "
+        f"DISCORD_BOT_TOKEN={env_presence('DISCORD_BOT_TOKEN')}, "
+        f"DISCORD_CLIENT_ID={env_presence('DISCORD_CLIENT_ID')}, "
+        f"DISCORD_CLIENT_SECRET={env_presence('DISCORD_CLIENT_SECRET')}, "
+        f"DISCORD_REDIRECT_URI={env_presence('DISCORD_REDIRECT_URI')}, "
+        f"VERIFIED_ROLE_ID={env_presence('VERIFIED_ROLE_ID')}, "
+        f"PORT={env_presence('PORT')}"
+    )
 
 # --- データ管理 ---
 def load_tokens():
@@ -207,6 +248,7 @@ def run_web():
 
 def validate_config():
     missing = []
+    invalid = []
     if not BOT_TOKEN:
         missing.append("DISCORD_BOT_TOKEN")
     if not CLIENT_ID:
@@ -215,18 +257,32 @@ def validate_config():
         missing.append("DISCORD_CLIENT_SECRET")
     if not REDIRECT_URI:
         missing.append("DISCORD_REDIRECT_URI")
+    if VERIFIED_ROLE_ID_ERROR:
+        invalid.append(VERIFIED_ROLE_ID_ERROR)
     if VERIFIED_ROLE_ID <= 0:
         missing.append("VERIFIED_ROLE_ID")
+    if PORT_ERROR:
+        invalid.append(PORT_ERROR)
+    if invalid:
+        raise RuntimeError("Invalid environment variables: " + "; ".join(invalid))
     if missing:
         raise RuntimeError("Missing required environment variables: " + ", ".join(missing))
 
 
 def main():
-    validate_config()
-    threading.Thread(target=run_web, daemon=True).start()
-    print(f"Starting bot with intents: members={intents.members}, message_content={intents.message_content}")
-    bot.run(BOT_TOKEN)
+    try:
+        log_startup_env()
+        validate_config()
+        threading.Thread(target=run_web, daemon=True).start()
+        print(f"Starting bot with intents: members={intents.members}, message_content={intents.message_content}")
+        bot.run(BOT_TOKEN)
+    except Exception as e:
+        print(f"Startup failure: {e}")
+        traceback.print_exc()
+        raise
 
 
 if __name__ == "__main__":
+    main()
+
     main()
