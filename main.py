@@ -156,6 +156,15 @@ intents.members = ENABLE_MEMBERS_INTENT
 intents.message_content = ENABLE_MESSAGE_CONTENT_INTENT
 bot = commands.Bot(command_prefix='.', intents=intents)
 
+
+def is_supported_image_attachment(attachment):
+    content_type = (attachment.content_type or "").lower()
+    if content_type.startswith("image/"):
+        return True
+
+    filename = attachment.filename.lower()
+    return filename.endswith((".png", ".jpg", ".jpeg", ".gif", ".webp"))
+
 class VerifyView(discord.ui.View):
     def __init__(self, guild_id, role_id):
         super().__init__(timeout=None)
@@ -170,6 +179,72 @@ class VerifyView(discord.ui.View):
         url = f"https://discord.com/api/oauth2/authorize?{query}"
         self.add_item(discord.ui.Button(label="認証する", url=url, emoji="✅", style=discord.ButtonStyle.link))
 
+
+class SetupVerifyConfigView(discord.ui.View):
+    def __init__(self, author_id, guild_id, image_attachment=None):
+        super().__init__(timeout=300)
+        self.author_id = author_id
+        self.guild_id = guild_id
+        self.image_attachment = image_attachment
+        self.selected_role = None
+
+    async def interaction_check(self, interaction):
+        if interaction.user.id != self.author_id:
+            await interaction.response.send_message("❌ この設定パネルはコマンド実行者のみ操作できます。", ephemeral=True)
+            return False
+        return True
+
+    @discord.ui.select(
+        cls=discord.ui.RoleSelect,
+        placeholder="認証後に付与するロールを選択",
+        min_values=1,
+        max_values=1,
+    )
+    async def select_role(self, interaction, select):
+        self.selected_role = select.values[0]
+        await interaction.response.send_message(f"✅ ロールを選択しました: {self.selected_role.mention}", ephemeral=True)
+
+    @discord.ui.button(label="認証パネルを作成", style=discord.ButtonStyle.success)
+    async def confirm(self, interaction, button):
+        if self.selected_role is None:
+            await interaction.response.send_message("❌ 先に付与するロールを選択してください。", ephemeral=True)
+            return
+
+        embed = discord.Embed(
+            title="✅ 認証パネル",
+            description=(
+                "👤 **認証をしてサーバーを楽しみましょう！！！** 👤\n\n"
+                f"🛡️ **認証後に {self.selected_role.mention} が付与されます**\n\n"
+                "下のボタンを押して認証を開始してください。\n"
+                "認証後、自動的にロールが付与されます。"
+            ),
+            color=0x2b2d31,
+        )
+        embed.set_thumbnail(url="https://ui-avatars.com/api/?name=Auth&background=3b82f6&color=fff")
+
+        send_kwargs = {
+            "embed": embed,
+            "view": VerifyView(self.guild_id, self.selected_role.id),
+        }
+
+        if self.image_attachment is not None:
+            image_file = await self.image_attachment.to_file()
+            embed.set_image(url=f"attachment://{image_file.filename}")
+            send_kwargs["file"] = image_file
+
+        await interaction.channel.send(**send_kwargs)
+        await interaction.response.send_message("✅ 認証パネルを投稿しました。", ephemeral=True)
+        self.stop()
+
+    @discord.ui.button(label="キャンセル", style=discord.ButtonStyle.secondary)
+    async def cancel(self, interaction, button):
+        await interaction.response.send_message("設定をキャンセルしました。", ephemeral=True)
+        self.stop()
+
+    async def on_timeout(self):
+        for child in self.children:
+            child.disabled = True
+
 @bot.event
 async def on_ready():
     print(f"✅ Bot Logged in as {bot.user}")
@@ -182,14 +257,30 @@ async def setup_verify(ctx):
         await ctx.send("❌ このコマンドはサーバー内でのみ使用できます。")
         return
 
+    image_attachment = None
+    if ctx.message.attachments:
+        image_attachment = ctx.message.attachments[0]
+        if not is_supported_image_attachment(image_attachment):
+            await ctx.send("❌ 添付ファイルは画像のみ対応です。png / jpg / jpeg / gif / webp を使ってください。")
+            return
+
     embed = discord.Embed(
-        title="✅ 認証パネル",
-        description="👤 **認証をしてサーバーを楽しみましょう！！！** 👤\n\n🛡️ **認証後に <@&{VERIFIED_ROLE_ID}> が付与されます**\n\n下のボタンを押して認証を開始してください。\n認証後、自動的にロールが付与されます。".format(VERIFIED_ROLE_ID=VERIFIED_ROLE_ID),
-        color=0x2b2d31
+        title="認証パネル設定",
+        description=(
+            "下のセレクトメニューから認証後に付与するロールを選択してください。\n"
+            "画像を付けたい場合は、`.setup_verify` を画像添付つきで送信してください。"
+        ),
+        color=0x2b2d31,
     )
-    # 画像のURL（必要に応じて変更してください）
-    embed.set_thumbnail(url="https://ui-avatars.com/api/?name=Auth&background=3b82f6&color=fff")
-    await ctx.send(embed=embed, view=VerifyView(ctx.guild.id, VERIFIED_ROLE_ID))
+    if image_attachment is not None:
+        embed.add_field(name="画像", value=f"添付画像を使用します: `{image_attachment.filename}`", inline=False)
+    else:
+        embed.add_field(name="画像", value="今回は画像なしで作成します。", inline=False)
+
+    await ctx.send(
+        embed=embed,
+        view=SetupVerifyConfigView(ctx.author.id, ctx.guild.id, image_attachment=image_attachment),
+    )
 
 @bot.command()
 @commands.has_permissions(administrator=True)
